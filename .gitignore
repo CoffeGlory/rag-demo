@@ -1,0 +1,26 @@
+# secrets
+.env
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# model/cache
+.cache/
+*.bin
+
+# chroma db (vector store files)
+chroma_db/
+
+# data files (PDFs, etc.)
+data/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

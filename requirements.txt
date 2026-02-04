@@ -1,0 +1,7 @@
+streamlit
+fastapi
+uvicorn
+requests
+openai
+pinecone[grpc]
+pypdf
