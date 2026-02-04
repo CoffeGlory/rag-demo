@@ -81,6 +81,26 @@ def query_doc(question: str, top_k: int):
     matches = res.get("matches", [])
     return [m["metadata"].get("text", "") for m in matches]   
 
+def generate_answer(question: str, chunks: list[str]) -> str:
+    context = "\n\n".join([f"[Chunk {i+1}]\n{c}" for i, c in enumerate(chunks)])
+
+    resp = oai.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a helpful assistant. Answer the user's question using ONLY the provided context. "
+                    "If the answer is not in the context, say you don't know."
+                ),
+            },
+            {"role": "user", "content": f"Question: {question}\n\nContext:\n{context}"},
+        ],
+        temperature=0.2,
+    )
+    return resp.choices[0].message.content
+
+
 # ----------------------------
 # UI
 # ----------------------------
@@ -108,7 +128,7 @@ if uploaded:
         with st.spinner("Embedding + Upserting to Pinecone..."):
             upsert_doc(doc_id, chunks)
 
-        st.success("Indexed to Pinecone ✅")
+        st.success("Indexed to Pinecone successfully!")
 
 question = st.text_input("Ask a question about the PDF")
 if st.button("Ask"):
@@ -118,6 +138,12 @@ if st.button("Ask"):
 
     with st.spinner("Retrieving from Pinecone..."):
         chunks = query_doc(question, top_k)
+
+    with st.spinner("Generating answer..."):
+        answer = generate_answer(question, chunks)
+
+    st.subheader("Answer")
+    st.write(answer)
 
     st.subheader("Retrieved Chunks")
     for i, c in enumerate(chunks, 1):
