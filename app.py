@@ -20,11 +20,15 @@ oai = OpenAI(api_key=OPENAI_API_KEY)
 pc = Pinecone(api_key=PINECONE_API_KEY)
 
 # Connect pinecone index via host (stable)
-_indexes = pc.list_indexes()
-_host = next((i["host"] for i in _indexes if i["name"] == PINECONE_INDEX), None)
-if not _host:
-    st.error(f"Pinecone index '{PINECONE_INDEX}' not found.")
-    st.stop()
+@st.cache_resource
+def get_index():
+    indexes = pc.list_indexes()
+    host = next((i["host"] for i in indexes if i["name"] == PINECONE_INDEX), None)
+    if not host:
+        raise RuntimeError(f"Pinecone index '{PINECONE_INDEX}' not found")
+    return pc.Index(host=host)
+
+
 
 def embed_1024(texts: list[str]) -> list[list[float]]:
     resp = oai.embeddings.create(
@@ -53,6 +57,7 @@ def read_pdf_bytes_to_text(pdf_bytes: bytes) -> str:
     return "\n".join(pages)
 
 def upsert_doc(doc_id: str, chunks: list[str]):
+    index = get_index()
     vecs = embed_1024(chunks)
     vectors = []
     for i, (c, v) in enumerate(zip(chunks, vecs)):
@@ -65,6 +70,7 @@ def upsert_doc(doc_id: str, chunks: list[str]):
 
 
 def query_doc(question: str, top_k: int):
+    index = get_index()
     qv = embed_1024([question])[0]
     res = index.query(
         vector=qv,
