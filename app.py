@@ -1,11 +1,18 @@
+import io
 import streamlit as st
 import hashlib
 from pypdf import PdfReader
 from openai import OpenAI
 from pinecone.grpc import PineconeGRPC as Pinecone
-import requests
+from pathlib import Path
+import requests 
 
+# ----------------------------
+# Configuration
+# set_page_config should be called only once, at the beginning
+# its purpose is to set the title and layout of the Streamlit app
 st.set_page_config(page_title="My RAG App", layout="wide")
+DEFAULT_PDF_PATH = Path("data/NASM_CPT7_Study_Guide.pdf")
 
 # ----------------------------
 # Secrets (Streamlit Cloud uses st.secrets)
@@ -15,7 +22,6 @@ OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 PINECONE_API_KEY = st.secrets["PINECONE_API_KEY"]
 PINECONE_INDEX = st.secrets["PINECONE_INDEX"]          # nasmrag
 PINECONE_NAMESPACE = st.secrets.get("PINECONE_NAMESPACE", "__default__")
-
 oai = OpenAI(api_key=OPENAI_API_KEY)
 pc = Pinecone(api_key=PINECONE_API_KEY)
 
@@ -28,8 +34,10 @@ def get_index():
         raise RuntimeError(f"Pinecone index '{PINECONE_INDEX}' not found")
     return pc.Index(host=host)
 
-
-
+# ----------------------------
+# RAG functions
+# Default: use 1024-dim embeddings for Pinecone, has to match the index config
+# ----------------------------
 def embed_1024(texts: list[str]) -> list[list[float]]:
     resp = oai.embeddings.create(
         model="text-embedding-3-large",
@@ -37,6 +45,7 @@ def embed_1024(texts: list[str]) -> list[list[float]]:
         dimensions=1024,
     )
     return [d.embedding for d in resp.data]
+
 
 def chunk_text(text: str, max_chars: int = 1200, overlap: int = 200) -> list[str]:
     # 简单稳定：按字符切（先别做token切，等你上线再优化）
@@ -49,12 +58,24 @@ def chunk_text(text: str, max_chars: int = 1200, overlap: int = 200) -> list[str
         i = j - overlap if j - overlap > i else j
     return [c.strip() for c in chunks if c.strip()]
 
+
+# -----------------------------
+# preprocess PDF, upsert to Pinecone, query from Pinecone
+# -----------------------------
 def read_pdf_bytes_to_text(pdf_bytes: bytes) -> str:
-    reader = PdfReader(pdf_bytes)
+    # io here is to wrap bytes into a file-like object for PdfReader, previous version used file directly
+    reader = PdfReader(io.BytesIO(pdf_bytes))
     pages = []
     for p in reader.pages:
         pages.append(p.extract_text() or "")
     return "\n".join(pages)
+
+def load_default_pdf():
+    if not DEFAULT_PDF_PATH.exists():
+        return None, None, None
+    pdf_bytes = DEFAULT_PDF_PATH.read_bytes()
+    doc_id = hashlib.sha1(pdf_bytes).hexdigest()[:12]
+    return pdf_bytes, doc_id, DEFAULT_PDF_PATH.name
 
 def upsert_doc(doc_id: str, chunks: list[str]):
     index = get_index()
@@ -101,168 +122,155 @@ def generate_answer(question: str, chunks: list[str]) -> str:
     return resp.choices[0].message.content
 
 
+
+
+
+
+
+
+
+# -----------------------------
+# Debug Test for serects access
+# -----------------------------
+def test_secrets_access():
+    try:
+        _ = OPENAI_API_KEY
+        st.sidebar.success("Secrets access: OK")
+        st.sidebar.success("OpenAI Pinecone: OK")
+    except Exception as e:
+        st.sidebar.error(f"Secrets access error: {e}")
+
+
 # ----------------------------
 # UI
 # ----------------------------
-st.set_page_config(page_title="My RAG App", layout="wide")
 st.title("RAG Demo (Streamlit + Pinecone)")
 st.caption("Upload PDF → index to Pinecone → ask questions")
+test_secrets_access()
 
 with st.sidebar:
     st.header("Settings")
     top_k = st.slider("Top K", 1, 10, 5)
     st.divider()
 
+# -----------------------------
+# PDF uploader
+# -----------------------------
 uploaded = st.file_uploader("Upload a PDF", type=["pdf"])
-if uploaded:
+
+pdf_bytes = None
+doc_id = None
+filename = None
+source = None  # "upload" or "default"
+
+if uploaded is not None:
     pdf_bytes = uploaded.read()
     doc_id = hashlib.sha1(pdf_bytes).hexdigest()[:12]
-    st.success(f"Uploaded: {uploaded.name}  |  doc_id: {doc_id}")
+    filename = uploaded.name
+    source = "upload"
+else:
+    b, did, name = load_default_pdf()
+    if b is not None:
+        pdf_bytes, doc_id, filename = b, did, name
+        source = "default"
+        st.info(f"Default PDF: {filename}")
+    else:
+        st.caption("Tip: Put a demo file at data/default.pdf to enable default loading.")
+# Show current doc info (if any)
+# TODO : hide this message if no PDF loaded
+if pdf_bytes is not None:
+    st.success(f"Loaded: {filename} | doc_id: {doc_id} | source: {source}")
 
+# -----------------------------
+# Small optimization: avoid re-indexing the same doc_id
+# -----------------------------
+if "indexed_docs" not in st.session_state:
+    st.session_state["indexed_docs"] = set()
+
+# Index button works for BOTH upload and default
+# -----------------------------
+# Pinecone Index
+# if it's already in pinecone session_state, skip indexing
+if pdf_bytes is not None:
     if st.button("Index this PDF to Pinecone"):
-        with st.spinner("Parsing PDF..."):
-            text = read_pdf_bytes_to_text(pdf_bytes)
-        chunks = chunk_text(text)
-        st.write(f"Total chunks: {len(chunks)}")
+        if doc_id in st.session_state["indexed_docs"]:
+            st.warning("This document is already indexed in this session.")
+        else:
+            with st.spinner("Parsing PDF..."):
+                text = read_pdf_bytes_to_text(pdf_bytes)
 
-        with st.spinner("Embedding + Upserting to Pinecone..."):
-            upsert_doc(doc_id, chunks)
+            chunks = chunk_text(text)
+            st.write(f"Total chunks: {len(chunks)}")
 
-        st.success("Indexed to Pinecone successfully!")
+            with st.spinner("Embedding + Upserting to Pinecone..."):
+                upsert_doc(doc_id, chunks)
 
-question = st.text_input("Ask a question about the PDF")
-if st.button("Ask"):
-    if not question.strip():
-        st.warning("Please enter a question.")
-        st.stop()
+            st.session_state["indexed_docs"].add(doc_id)
+            st.success("Indexed to Pinecone successfully!")
 
-    with st.spinner("Retrieving from Pinecone..."):
-        chunks = query_doc(question, top_k)
+# -----------------------------
+# Chat state
+# -----------------------------
+if "messages" not in st.session_state:
+    # Each message: {"role": "user"|"assistant", "content": "..."}
+    st.session_state["messages"] = [
+        {"role": "assistant", "content": "Hello! I'm your RAG assistant. Please upload a PDF and ask me anything about it. (Mock)"}
+    ]
 
-    with st.spinner("Generating answer..."):
-        answer = generate_answer(question, chunks)
+# What's the purpose of last_retrieved?
+# st.session_state["last_retrieved"] seems to be intended to store the last set of retrieved chunks from Pinecone for potential display or further processing.
+if "last_retrieved" not in st.session_state:
+    st.session_state["last_retrieved"] = []
 
-    st.subheader("Answer")
-    st.write(answer)
+# Render chat history
+for msg in st.session_state["messages"]:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+# -----------------------------
+# Chat input
 
-    st.subheader("Retrieved Chunks")
-    for i, c in enumerate(chunks, 1):
-        with st.expander(f"Chunk #{i}", expanded=False):
-            st.write(c)
+prompt = st.chat_input("Ask a question about the PDF")
+if prompt:
+    # Default pdf exist
 
+    # 1) 先显示用户消息
+    st.session_state["messages"].append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
 
-# #---------------
-# # Mock RAG answer (no API)
-# # Later will replace with retrieve + LLM
-# #---------------
-# def rag_answer_mock(question: str, top_k: int, uploaded_file):
-#     resp = requests.post(
-#         "http://127.0.0.1:8000/ask_with_file",
-#         data={
-#             "question": question,
-#             "top_k": str(top_k),
-#         },
-#         files={
-#             "file": (uploaded_file.name, uploaded_file.getvalue(), "application/pdf")
-#         },
-#         timeout=60,
-#     )
+    # 2) 检索 + 生成（在 assistant 气泡里完成）
+    with st.chat_message("assistant"):
+        # if uploaded is None:
+        #     st.warning("Please upload a PDF first, then click 'Index this PDF to Pinecone'.")
+        #     st.stop()
 
-#     # if not 200, raise error
-#     if resp.status_code != 200:
-#         raise RuntimeError(
-#             f"Backend error: {resp.status_code}\n"
-#             f"{resp.text}"
-#         )
+        # st.spinner is a context manager that shows a spinner while the code inside is running
+        with st.spinner("Retrieving from Pinecone..."):
+            chunks = query_doc(prompt, top_k)
 
-#     #  get answer and chunks at 200
-#     data = resp.json()
-#     return data["answer"], data["chunks"]
+        # last_retrieved means the last set of chunks retrieved from Pinecone
+        st.session_state["last_retrieved"] = chunks
 
-# #---------------
-# # Sidebar: setting
-# #---------------
-# with st.sidebar:
-#     st.header("Settings")
-#     top_k = st.slider("Top K", min_value=1, max_value=20, value=5)
-#     use_mock = st.checkbox("Use mock answer", value=True)
-#     st.divider()
-#     if st.button("Clear chat", use_container_width=True):
-#         st.session_state.pop("messages", None)
-#         st.session_state.pop("last_chunks", None)
-#         st.rerun()
+        with st.spinner("Generating answer..."):
+            answer = generate_answer(prompt, chunks)
 
-# # -----------------------------
-# # Title
-# # -----------------------------
-# st.title("Rag Demo App")
-# st.caption("ui by Streamlit + backend by FastAPI")
+        st.markdown(answer)
+
+    # 3) 把助手回答写入历史
+    st.session_state["messages"].append({"role": "assistant", "content": answer})
+
+# -----------------------------
+# 把 Retrieved Chunks 放到侧边栏/折叠区，不打断聊天流
+# -----------------------------
+with st.sidebar:
+    st.divider()
+    st.subheader("Last Retrieved Chunks")
+    chunks = st.session_state.get("last_retrieved", [])
+    if not chunks:
+        st.caption("No chunks retrieved yet.")
+    else:
+        for i, c in enumerate(chunks, 1):
+            with st.expander(f"Chunk #{i}", expanded=False):
+                st.write(c)
 
 
-# # -----------------------------
-# # PDF uploader
-# # -----------------------------
-# uploaded = st.file_uploader("Upload a PDF file", type=["pdf"])
-# if uploaded is not None:
-#     st.success(f"Uploaded: {uploaded.name} ({uploaded.size} bytes)")
-
-# # -----------------------------
-# # Chat state
-# # -----------------------------
-# if "messages" not in st.session_state:
-#     # Each message: {"role": "user"|"assistant", "content": "..."}
-#     st.session_state["messages"] = [
-#         {"role": "assistant", "content": "Hello! I'm your RAG assistant. Please upload a PDF and ask me anything about it. (Mock)"}
-#     ]
-
-# # Render chat history
-# for msg in st.session_state["messages"]:
-#     with st.chat_message(msg["role"]):
-#         st.markdown(msg["content"])
-
-# # -----------------------------
-# # Chat input
-# # -----------------------------
-# prompt = st.chat_input("Ask a question about the PDF...")
-
-# if prompt:
-#     # Guard: must upload PDF first
-#     if uploaded is None:
-#         with st.chat_message("assistant"):
-#             st.error("Please upload a PDF file first.")
-#         st.stop()
-
-#     # 1) Show user message
-#     st.session_state["messages"].append({"role": "user", "content": prompt})
-#     with st.chat_message("user"):
-#         st.markdown(prompt)
-    
-#     # 2) Get RAG answer
-#     with st.chat_message("assistant"):
-#         answer = ""
-#         chunks = []
-#         try:
-#             with st.spinner("Thinking..."):
-#                 if use_mock:
-#                     answer, chunks = rag_answer_mock(prompt, top_k, uploaded)
-#                 else:  
-#                     answer = "turn on the backend to get real answer."
-#                     chunks =[]
-#                 st.markdown(answer)
-#         except Exception as e:
-#             st.error("Failed to call backend.")
-#             st.code(str(e))
-#             chunks = []
-        
-
-#         #Store chunks for optional display
-#         st.session_state["last_chunks"] = chunks
-
-#         #Expandable retrieved chunks
-#         if chunks:
-#             with st.expander("Retrieved Chunks", expanded=False):
-#                 for i, c in enumerate(chunks, start=1):
-#                     st.markdown(f"**Chunk #{i}**")
-#                     st.write(c)
-#     # 3) Save assistant message
-#     st.session_state["messages"].append({"role": "assistant", "content": answer})
