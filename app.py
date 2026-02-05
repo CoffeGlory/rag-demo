@@ -89,18 +89,33 @@ def upsert_doc(doc_id: str, chunks: list[str]):
         })
     index.upsert(vectors=vectors, namespace=PINECONE_NAMESPACE)
 
-
+# -----------------------------
+# Query from Pinecone, generate answer, and filter
+# -----------------------------
+# input variables: 
+# question:str | user's question
+# top_k:int | number of top similar chunks to retrieve
+# output: list of (score, text) tuples
 def query_doc(question: str, top_k: int):
     index = get_index()
     qv = embed_1024([question])[0]
+
+    active_doc_id = st.session_state.get("active_doc_id")
+    if not active_doc_id:  
+        return []
+    
     res = index.query(
         vector=qv,
         top_k=top_k,
         include_metadata=True,
         namespace=PINECONE_NAMESPACE,
+        filter={"doc_id": active_doc_id}, #why there is a comma here, make it a tuple
+
     )
     matches = res.get("matches", [])
-    return [m["metadata"].get("text", "") for m in matches]   
+    # return (score, text) tuples
+    return [(m.get("score", 0.0), m["metadata"].get("text", "")) for m in matches]
+
 
 def generate_answer(question: str, chunks: list[str]) -> str:
     context = "\n\n".join([f"[Chunk {i+1}]\n{c}" for i, c in enumerate(chunks)])
@@ -111,8 +126,12 @@ def generate_answer(question: str, chunks: list[str]) -> str:
             {
                 "role": "system",
                 "content": (
-                    "You are a helpful assistant. Answer the user's question using ONLY the provided context. "
-                    "If the answer is not in the context, say you don't know."
+                    "You are a rigorous RAG assistant.\n"
+                    "Use ONLY the provided context. Do NOT use outside knowledge.\n"
+                    "If the context does not explicitly define a term, you may still give a brief description "
+                    "based on what the context says about it, and quote the exact phrases you relied on.\n"
+                    "If the context provides no relevant information at all, say 'I don't know.'\n"
+                    "Keep the answer short and factual."
                 ),
             },
             {"role": "user", "content": f"Question: {question}\n\nContext:\n{context}"},
@@ -120,13 +139,6 @@ def generate_answer(question: str, chunks: list[str]) -> str:
         temperature=0.2,
     )
     return resp.choices[0].message.content
-
-
-
-
-
-
-
 
 
 # -----------------------------
@@ -146,12 +158,18 @@ def test_secrets_access():
 # ----------------------------
 st.title("RAG Demo (Streamlit + Pinecone)")
 st.caption("Upload PDF → index to Pinecone → ask questions")
-test_secrets_access()
+
+
+# [Strict file based] This sections support openai only generate based on target PDF  
+if "indexed_docs" not in st.session_state:
+    st.session_state["indexed_docs"] = set()
+# -----------------------------
+
 
 with st.sidebar:
     st.header("Settings")
     top_k = st.slider("Top K", 1, 10, 5)
-    st.divider()
+    # st.divider()
 
 # -----------------------------
 # PDF uploader
@@ -176,21 +194,47 @@ else:
         st.info(f"Default PDF: {filename}")
     else:
         st.caption("Tip: Put a demo file at data/default.pdf to enable default loading.")
+
+# [Strict file based] This sections support openai only generate based on target PDF  
+# Store active doc_id in session_state
+st.session_state["active_doc_id"] = doc_id
+# -----------------------------
+
+# -----------------------------
+# Sidebar info
+# -----------------------------
 # Show current doc info (if any)
 # TODO : hide this message if no PDF loaded
 if pdf_bytes is not None:
     st.success(f"Loaded: {filename} | doc_id: {doc_id} | source: {source}")
 
+active_doc_id = st.session_state.get("active_doc_id")
+is_indexed = (
+    active_doc_id in st.session_state["indexed_docs"]
+    if active_doc_id
+    else False
+)
+
+
+test_secrets_access()
+with st.sidebar:
+    # st.divider()
+    st.caption(f"Active doc_id: {active_doc_id if active_doc_id else '(none)'}")
+    # st.caption("Indexed: " + ("✅" if is_indexed else "❌ (not indexed yet)"))
+    if is_indexed:
+        st.sidebar.success("Indexed: YES")
+    else:
+        st.sidebar.warning("Indexed: NO (click Index)")
+
 # -----------------------------
-# Small optimization: avoid re-indexing the same doc_id
+# Pinecone Insert button
+# optimization: avoid re-indexing the same doc_id
 # -----------------------------
+# Pinecone Index button
+# if it's already in pinecone session_state, skip indexing
 if "indexed_docs" not in st.session_state:
     st.session_state["indexed_docs"] = set()
 
-# Index button works for BOTH upload and default
-# -----------------------------
-# Pinecone Index
-# if it's already in pinecone session_state, skip indexing
 if pdf_bytes is not None:
     if st.button("Index this PDF to Pinecone"):
         if doc_id in st.session_state["indexed_docs"]:
@@ -207,6 +251,9 @@ if pdf_bytes is not None:
 
             st.session_state["indexed_docs"].add(doc_id)
             st.success("Indexed to Pinecone successfully!")
+            st.rerun() # Refresh to update sidebar status
+#TODO: this index is per session only, need to persist in real app
+
 
 # -----------------------------
 # Chat state
@@ -229,10 +276,32 @@ for msg in st.session_state["messages"]:
 # -----------------------------
 # Chat input
 
+# -----------------------------
+# Prompt section
+# -----------------------------
 prompt = st.chat_input("Ask a question about the PDF")
 if prompt:
-    # Default pdf exist
+    st.sidebar.write("DEBUG: got prompt")
+    st.sidebar.write("DEBUG active_doc_id:", st.session_state.get("active_doc_id"))
+    st.sidebar.write("DEBUG indexed_docs size:", len(st.session_state.get("indexed_docs", set())))
 
+    #Guard start
+    active_doc_id = st.session_state.get("active_doc_id")
+    # 严格模式 guard 1：必须有 active_doc_id
+    if not active_doc_id:
+        st.session_state["messages"].append({"role": "assistant", "content": "No active PDF loaded."})
+        st.rerun()
+
+    # 严格模式 guard 2：必须先 index
+    if active_doc_id not in st.session_state.get("indexed_docs", set()):
+        st.session_state["messages"].append({
+            "role": "assistant",
+            "content": "This PDF is not indexed yet. Please click **Index this PDF to Pinecone** first."
+        })
+        st.rerun()
+    #Guard end
+
+    
     # 1) 先显示用户消息
     st.session_state["messages"].append({"role": "user", "content": prompt})
     with st.chat_message("user"):
@@ -246,31 +315,37 @@ if prompt:
 
         # st.spinner is a context manager that shows a spinner while the code inside is running
         with st.spinner("Retrieving from Pinecone..."):
-            chunks = query_doc(prompt, top_k)
+            retrieved = query_doc(prompt, top_k)
+            st.sidebar.write("DEBUG: retrieved len:", len(retrieved))
+
+            
 
         # last_retrieved means the last set of chunks retrieved from Pinecone
-        st.session_state["last_retrieved"] = chunks
-
+        st.session_state["last_retrieved"] = retrieved
+        chunks_texts = [t for _, t in retrieved]
         with st.spinner("Generating answer..."):
-            answer = generate_answer(prompt, chunks)
+            answer = generate_answer(prompt, chunks_texts)
 
         st.markdown(answer)
+        st.sidebar.write("DEBUG: generated answer length:", len(answer) if answer else 0)
+
 
     # 3) 把助手回答写入历史
     st.session_state["messages"].append({"role": "assistant", "content": answer})
 
+
 # -----------------------------
-# 把 Retrieved Chunks 放到侧边栏/折叠区，不打断聊天流
+# 把 last Retrieved Chunks 放到侧边栏/折叠区，不打断聊天流
 # -----------------------------
 with st.sidebar:
     st.divider()
     st.subheader("Last Retrieved Chunks")
-    chunks = st.session_state.get("last_retrieved", [])
-    if not chunks:
+    retrieved = st.session_state.get("last_retrieved", [])
+    if not retrieved:
         st.caption("No chunks retrieved yet.")
     else:
-        for i, c in enumerate(chunks, 1):
-            with st.expander(f"Chunk #{i}", expanded=False):
-                st.write(c)
+        for i, (score, text) in enumerate(retrieved, 1):
+            with st.expander(f"Chunk #{i} (score: {score:.3f})", expanded=False):
+                st.write(text)
 
 
