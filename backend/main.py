@@ -30,7 +30,6 @@ PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX = os.getenv("PINECONE_INDEX")         # nasmrag
 PINECONE_NAMESPACE = os.getenv("PINECONE_NAMESPACE", "pdf")
 
-# CHANGED: explicit env checks (you already did this)
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is not set")
 if not PINECONE_API_KEY:
@@ -85,18 +84,36 @@ def embed_1024(texts: List[str]) -> List[List[float]]:
     return [d.embedding for d in resp.data]
 
 def marker_id_for(doc_id: str) -> str:
-    # CHANGED: deterministic marker id for idempotent indexing
     return f"{doc_id}::marker"
 
+def make_marker_vector(dim: int) -> List[float]:
+    # CHANGED: Pinecone dense vectors cannot be all-zero. Must contain >=1 non-zero value.
+    v = [0.0] * dim
+    v[0] = 1e-6  # tiny non-zero value, won’t affect similarity usage (we never query marker anyway)
+    return v
+
+def _fetch_vectors_dict(fetch_res) -> dict:
+    # CHANGED: handle both dict-like and object-like responses from pinecone grpc
+    if isinstance(fetch_res, dict):
+        return fetch_res.get("vectors", {}) or {}
+    return getattr(fetch_res, "vectors", {}) or {}
+
+def _vector_metadata(vec_obj) -> dict:
+    # CHANGED: handle both dict-like and object-like vector entries
+    if isinstance(vec_obj, dict):
+        return vec_obj.get("metadata", {}) or {}
+    return getattr(vec_obj, "metadata", {}) or {}
+
 def is_already_indexed(doc_id: str) -> Tuple[bool, Optional[int]]:
-    # CHANGED: idempotency check via marker fetch
     mid = marker_id_for(doc_id)
     res = pine_index.fetch(ids=[mid], namespace=PINECONE_NAMESPACE)
-    vectors = res.get("vectors", {}) if isinstance(res, dict) else getattr(res, "vectors", {})
+    vectors = _fetch_vectors_dict(res)
+
     if mid in vectors:
-        md = vectors[mid].get("metadata", {}) if isinstance(vectors[mid], dict) else getattr(vectors[mid], "metadata", {}) or {}
+        md = _vector_metadata(vectors[mid])
         total = md.get("total_chunks")
         return True, total
+
     return False, None
 
 def upsert_doc_with_marker(doc_id: str, chunks: List[str]) -> int:
@@ -111,10 +128,10 @@ def upsert_doc_with_marker(doc_id: str, chunks: List[str]) -> int:
             "metadata": {"text": c, "doc_id": doc_id, "chunk_id": i},
         })
 
-    # CHANGED: also upsert marker vector (zero vector) so /index becomes idempotent
+    # CHANGED: marker vector must be NON-ZERO or Pinecone throws 500
     vectors.append({
         "id": marker_id_for(doc_id),
-        "values": [0.0] * EMBED_DIM,
+        "values": make_marker_vector(EMBED_DIM),  # ✅ fixed
         "metadata": {"doc_id": doc_id, "is_marker": True, "total_chunks": len(chunks)},
     })
 
@@ -169,13 +186,12 @@ class AskRequest(BaseModel):
     doc_id: Optional[str] = None
 
 # ----------------------------
-# Endpoints (CHANGED: async)
+# Endpoints (async)
 # ----------------------------
 @app.get("/")
 async def root():
     return {
         "msg": "RAG backend is running",
-        # CHANGED: list the real endpoints
         "endpoints": ["/health", "/index", "/ask", "/docs"]
     }
 
@@ -191,14 +207,14 @@ async def index_pdf(file: UploadFile = File(...)):
     # 2) compute stable doc_id
     doc_id = hashlib.sha1(pdf_bytes).hexdigest()[:12]
 
-    # CHANGED: idempotent check - if marker exists, skip re-indexing
+    # idempotent check - if marker exists, skip re-indexing
     already, total = await anyio.to_thread.run_sync(is_already_indexed, doc_id)
     if already:
         return {
             "doc_id": doc_id,
-            "total_chunks": total,  # may be None if old marker missing metadata
+            "total_chunks": total,
             "namespace": PINECONE_NAMESPACE,
-            "already_indexed": True,  # CHANGED
+            "already_indexed": True,
         }
 
     # 3) extract + chunk (CPU-bound, run in thread)
@@ -212,12 +228,12 @@ async def index_pdf(file: UploadFile = File(...)):
         "doc_id": doc_id,
         "total_chunks": total_chunks,
         "namespace": PINECONE_NAMESPACE,
-        "already_indexed": False,  # CHANGED
+        "already_indexed": False,
     }
 
 @app.post("/ask")
 async def ask(req: AskRequest):
-    # CHANGED: run retrieval + generation in threads (OpenAI/Pinecone calls are blocking)
+    # run retrieval + generation in threads (OpenAI/Pinecone calls are blocking)
     chunks, scores = await anyio.to_thread.run_sync(retrieve_chunks, req.question, req.top_k, req.doc_id)
     answer = await anyio.to_thread.run_sync(generate_answer, req.question, chunks)
     return {"answer": answer, "chunks": chunks, "scores": scores}
