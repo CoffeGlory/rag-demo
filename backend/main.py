@@ -70,14 +70,23 @@ class AskRequest(BaseModel):
 
 # ====== API Endpoints ======
 # health check endpoint
+@app.get("/")
+def root():
+    return {
+        "msg": "RAG backend is running",
+        "endpoints": ["/health", "/ask", "/ask_with_file", "/docs"]
+    }
+
 @app.get("/health")
 def health():
     return {"ok": True}
 
 @app.post("/ask")
 def ask(req: AskRequest):
+    # 1) embed question
     qv = embed_1024([req.question])[0]
 
+    # 2) pinecone query
     query_kwargs = dict(
         namespace=PINECONE_NAMESPACE,
         vector=qv,
@@ -87,6 +96,7 @@ def ask(req: AskRequest):
     if req.doc_id:
         query_kwargs["filter"] = {"doc_id": req.doc_id}
 
+    # 3) extract chunks and scores
     res = pine_index.query(**query_kwargs)
     matches = res.get("matches", [])
     chunks = [m.get("metadata", {}).get("text", "") for m in matches]
@@ -94,28 +104,6 @@ def ask(req: AskRequest):
 
     return {"answer": "(Retrieval) returned chunks from Pinecone", "chunks": chunks, "scores": scores}
 
-
-@app.post("/ask")
-def ask(req: AskRequest):
-    # 1) embed question
-    qv = embed_1024([req.question])[0]
-
-    # 2) pinecone query
-    res = pine_index.query(
-        namespace=PINECONE_NAMESPACE,
-        vector=qv,
-        top_k=req.top_k,
-        include_metadata=True,
-    )
-
-    # 3) extract chunks
-    matches = res.get("matches", [])
-    chunks = [m["metadata"].get("text", "") for m in matches]
-
-    return {
-        "answer": "(Stage: Retrieval) returned top_k chunks from Pinecone.",
-        "chunks": chunks,
-    }
 
 @app.post("/ask_with_file")
 def ask_with_file(
