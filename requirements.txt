@@ -5,3 +5,4 @@ requests
 openai
 pinecone[grpc]
 pypdf
+python-multipart
