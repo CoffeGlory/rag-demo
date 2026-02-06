@@ -7,11 +7,20 @@ from pydantic import BaseModel
 from typing import Optional, List
 from pypdf import PdfReader
 from pinecone.grpc import PineconeGRPC as Pinecone
+from fastapi.middleware.cors import CORSMiddleware
 
 # load_dotenv()
 
 app = FastAPI()
 
+#CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # adjust this in production to specific domains
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
