@@ -1,31 +1,45 @@
 import io
 import os
-# from dotenv import load_dotenv
+import hashlib
+from typing import Optional, List, Tuple
+
+import anyio
 from openai import OpenAI
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel
-from typing import Optional, List
 from pypdf import PdfReader
 from pinecone.grpc import PineconeGRPC as Pinecone
 from fastapi.middleware.cors import CORSMiddleware
 
-# load_dotenv()
-
 app = FastAPI()
 
-#CORS
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # adjust this in production to specific domains
+    allow_origins=["*"],  # adjust in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ----------------------------
+# Env
+# ----------------------------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX = os.getenv("PINECONE_INDEX")         # nasmrag
 PINECONE_NAMESPACE = os.getenv("PINECONE_NAMESPACE", "pdf")
+
+# CHANGED: explicit env checks (you already did this)
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY is not set")
+if not PINECONE_API_KEY:
+    raise RuntimeError("PINECONE_API_KEY is not set")
+if not PINECONE_INDEX:
+    raise RuntimeError("PINECONE_INDEX is not set")
+
+# CHANGED: define embedding dim once (must match your Pinecone index dimension)
+EMBED_DIM = 1024
 
 # client
 oai = OpenAI(api_key=OPENAI_API_KEY)
@@ -39,17 +53,17 @@ if not host:
 
 pine_index = pc.Index(host=host)
 
+# ----------------------------
+# Utils
+# ----------------------------
+def read_pdf_bytes_to_text(pdf_bytes: bytes) -> str:
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    pages = [(p.extract_text() or "") for p in reader.pages]
+    return "\n".join(pages)
 
-# what is class in python?
-# class is a blueprint for creating objects. 
-# It defines a set of attributes and methods that the created objects (instances) will have. 
-# Classes allow for encapsulation of data and functionality, enabling code reuse and organization in object-oriented programming.
-
-# AskRequest method is used to define the structure of the request body for the /ask endpoint.
 def chunk_text(text: str, chunk_size: int = 1200, overlap: int = 150) -> List[str]:
-    #TODO tokenize later
     text = text.replace("\r\n", "\n")
-    chunks = []
+    chunks: List[str] = []
     start = 0
     n = len(text)
     while start < n:
@@ -66,81 +80,144 @@ def embed_1024(texts: List[str]) -> List[List[float]]:
     resp = oai.embeddings.create(
         model="text-embedding-3-large",
         input=texts,
-        dimensions=1024,
+        dimensions=EMBED_DIM,
     )
     return [d.embedding for d in resp.data]
 
+def marker_id_for(doc_id: str) -> str:
+    # CHANGED: deterministic marker id for idempotent indexing
+    return f"{doc_id}::marker"
+
+def is_already_indexed(doc_id: str) -> Tuple[bool, Optional[int]]:
+    # CHANGED: idempotency check via marker fetch
+    mid = marker_id_for(doc_id)
+    res = pine_index.fetch(ids=[mid], namespace=PINECONE_NAMESPACE)
+    vectors = res.get("vectors", {}) if isinstance(res, dict) else getattr(res, "vectors", {})
+    if mid in vectors:
+        md = vectors[mid].get("metadata", {}) if isinstance(vectors[mid], dict) else getattr(vectors[mid], "metadata", {}) or {}
+        total = md.get("total_chunks")
+        return True, total
+    return False, None
+
+def upsert_doc_with_marker(doc_id: str, chunks: List[str]) -> int:
+    # embed + upsert normal chunks
+    vecs = embed_1024(chunks)
+
+    vectors = []
+    for i, (c, v) in enumerate(zip(chunks, vecs)):
+        vectors.append({
+            "id": f"{doc_id}-{i}",
+            "values": v,
+            "metadata": {"text": c, "doc_id": doc_id, "chunk_id": i},
+        })
+
+    # CHANGED: also upsert marker vector (zero vector) so /index becomes idempotent
+    vectors.append({
+        "id": marker_id_for(doc_id),
+        "values": [0.0] * EMBED_DIM,
+        "metadata": {"doc_id": doc_id, "is_marker": True, "total_chunks": len(chunks)},
+    })
+
+    pine_index.upsert(vectors=vectors, namespace=PINECONE_NAMESPACE)
+    return len(chunks)
+
+def retrieve_chunks(question: str, top_k: int, doc_id: Optional[str]) -> Tuple[List[str], List[float]]:
+    qv = embed_1024([question])[0]
+
+    query_kwargs = dict(
+        namespace=PINECONE_NAMESPACE,
+        vector=qv,
+        top_k=top_k,
+        include_metadata=True,
+    )
+    if doc_id:
+        query_kwargs["filter"] = {"doc_id": doc_id}
+
+    res = pine_index.query(**query_kwargs)
+    matches = res.get("matches", [])
+    chunks = [m.get("metadata", {}).get("text", "") for m in matches]
+    scores = [m.get("score", 0.0) for m in matches]
+    return chunks, scores
+
+def generate_answer(question: str, chunks: List[str]) -> str:
+    context = "\n\n".join([f"[Chunk {i+1}]\n{c}" for i, c in enumerate(chunks)])
+
+    resp = oai.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a rigorous RAG assistant.\n"
+                    "Use ONLY the provided context. Do NOT use outside knowledge.\n"
+                    "If the context provides no relevant information at all, say 'I don't know.'\n"
+                    "Keep the answer short and factual."
+                ),
+            },
+            {"role": "user", "content": f"Question: {question}\n\nContext:\n{context}"},
+        ],
+        temperature=0.2,
+    )
+    return resp.choices[0].message.content
+
+# ----------------------------
 # Models
+# ----------------------------
 class AskRequest(BaseModel):
     question: str
     top_k: int = 5
     doc_id: Optional[str] = None
 
-
-# ====== API Endpoints ======
-# health check endpoint
+# ----------------------------
+# Endpoints (CHANGED: async)
+# ----------------------------
 @app.get("/")
-def root():
+async def root():
     return {
         "msg": "RAG backend is running",
-        "endpoints": ["/health", "/ask", "/ask_with_file", "/docs"]
+        # CHANGED: list the real endpoints
+        "endpoints": ["/health", "/index", "/ask", "/docs"]
     }
 
 @app.get("/health")
-def health():
+async def health():
     return {"ok": True}
 
-@app.post("/ask")
-def ask(req: AskRequest):
-    # 1) embed question
-    qv = embed_1024([req.question])[0]
+@app.post("/index")
+async def index_pdf(file: UploadFile = File(...)):
+    # 1) read bytes (fast, ok in async)
+    pdf_bytes = await file.read()
 
-    # 2) pinecone query
-    query_kwargs = dict(
-        namespace=PINECONE_NAMESPACE,
-        vector=qv,
-        top_k=req.top_k,
-        include_metadata=True,
-    )
-    if req.doc_id:
-        query_kwargs["filter"] = {"doc_id": req.doc_id}
+    # 2) compute stable doc_id
+    doc_id = hashlib.sha1(pdf_bytes).hexdigest()[:12]
 
-    # 3) extract chunks and scores
-    res = pine_index.query(**query_kwargs)
-    matches = res.get("matches", [])
-    chunks = [m.get("metadata", {}).get("text", "") for m in matches]
-    scores = [m.get("score", 0.0) for m in matches]
+    # CHANGED: idempotent check - if marker exists, skip re-indexing
+    already, total = await anyio.to_thread.run_sync(is_already_indexed, doc_id)
+    if already:
+        return {
+            "doc_id": doc_id,
+            "total_chunks": total,  # may be None if old marker missing metadata
+            "namespace": PINECONE_NAMESPACE,
+            "already_indexed": True,  # CHANGED
+        }
 
-    return {"answer": "(Retrieval) returned chunks from Pinecone", "chunks": chunks, "scores": scores}
+    # 3) extract + chunk (CPU-bound, run in thread)
+    text = await anyio.to_thread.run_sync(read_pdf_bytes_to_text, pdf_bytes)
+    chunks = await anyio.to_thread.run_sync(chunk_text, text)
 
-
-@app.post("/ask_with_file")
-def ask_with_file(
-    question: str = Form(...),
-    top_k: int = Form(...),
-    file: UploadFile = File(...)
-):
-    # 1) read pdf bytes from UploadFile
-    pdf_bytes = file.file.read()
-
-    # 2) extract text from pdf bytes
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    text_parts = []
-    for page in reader.pages:
-        text_parts.append(page.extract_text() or "")
-    text = "\n".join(text_parts)
-
-    # 3) chunk text and return top k chunks
-    chunks_all = chunk_text(text)
-    chunks = chunks_all[:top_k]
-
-    answer = (
-        f"question={question}\n"
-        f"filename={file.filename}\n"
-        f"total_chunks={len(chunks_all)}"
-    )
+    # 4) upsert (network + compute, run in thread)
+    total_chunks = await anyio.to_thread.run_sync(upsert_doc_with_marker, doc_id, chunks)
 
     return {
-        "answer": answer,
-        "chunks": chunks
+        "doc_id": doc_id,
+        "total_chunks": total_chunks,
+        "namespace": PINECONE_NAMESPACE,
+        "already_indexed": False,  # CHANGED
     }
+
+@app.post("/ask")
+async def ask(req: AskRequest):
+    # CHANGED: run retrieval + generation in threads (OpenAI/Pinecone calls are blocking)
+    chunks, scores = await anyio.to_thread.run_sync(retrieve_chunks, req.question, req.top_k, req.doc_id)
+    answer = await anyio.to_thread.run_sync(generate_answer, req.question, chunks)
+    return {"answer": answer, "chunks": chunks, "scores": scores}
