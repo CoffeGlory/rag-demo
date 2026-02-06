@@ -1,6 +1,6 @@
 import io
 import os
-from dotenv import load_dotenv
+# from dotenv import load_dotenv
 from openai import OpenAI
 from fastapi import FastAPI, UploadFile, File, Form
 from pydantic import BaseModel
@@ -8,20 +8,18 @@ from typing import Optional, List
 from pypdf import PdfReader
 from pinecone.grpc import PineconeGRPC as Pinecone
 
-load_dotenv()
+# load_dotenv()
 
 app = FastAPI()
 
 
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-PINECONE_API_KEY = os.environ["PINECONE_API_KEY"]
-PINECONE_INDEX = os.environ["PINECONE_INDEX"]          # nasmrag
-PINECONE_NAMESPACE = os.environ.get("PINECONE_NAMESPACE", "pdf")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+PINECONE_INDEX = os.getenv("PINECONE_INDEX")         # nasmrag
+PINECONE_NAMESPACE = os.getenv("PINECONE_NAMESPACE", "pdf")
 
-# OpenAI client
+# client
 oai = OpenAI(api_key=OPENAI_API_KEY)
-
-# Pinecone client
 pc = Pinecone(api_key=PINECONE_API_KEY)
 
 # find host based on list_indexes
@@ -39,23 +37,6 @@ pine_index = pc.Index(host=host)
 # Classes allow for encapsulation of data and functionality, enabling code reuse and organization in object-oriented programming.
 
 # AskRequest method is used to define the structure of the request body for the /ask endpoint.
-# ====== Models ======
-class AskRequest(BaseModel):
-    question: str
-    top_k: int
-    filename: Optional[str] | None = None
-# Optional means that the field can be omitted when creating an instance of the class.
-# The type hint Optional[str] | None indicates that the field can either be a string or None.
-
-# ====== Utils ======
-def exact_text_from_pdf_path(pdf_path: str) -> str:
-    reader = PdfReader(pdf_path)
-    parts = []
-    for page in reader.pages:
-        text = page.extract_text() or ""
-        parts.append(text)
-    return "\n".join(parts)
-
 def chunk_text(text: str, chunk_size: int = 1200, overlap: int = 150) -> List[str]:
     #TODO tokenize later
     text = text.replace("\r\n", "\n")
@@ -80,6 +61,13 @@ def embed_1024(texts: List[str]) -> List[List[float]]:
     )
     return [d.embedding for d in resp.data]
 
+# Models
+class AskRequest(BaseModel):
+    question: str
+    top_k: int = 5
+    doc_id: Optional[str] = None
+
+
 # ====== API Endpoints ======
 # health check endpoint
 @app.get("/health")
@@ -88,60 +76,24 @@ def health():
 
 @app.post("/ask")
 def ask(req: AskRequest):
-    # For now, return a mock answer
-    # 你先把一个 pdf 放到项目根目录，比如: E:\projects\rag-demo\data\demo.pdf
-    pdf_path = r"E:\projects\rag-demo\data\NASM_CPT7_Study_Guide.pdf"
+    qv = embed_1024([req.question])[0]
 
-    text = extract_text_from_pdf_path(pdf_path)
-    chunks_all = chunk_text(text)
-
-    # 先把前 top_k chunks 返回给前端展示
-    chunks = chunks_all[: req.top_k]
-
-    answer = (
-        "(Stage1) 我已经能从 PDF 抽取文本并切 chunk 了。\n"
-        f"question={req.question}\n"
-        f"file={req.filename}\n"
-        f"total_chunks={len(chunks_all)}"
+    query_kwargs = dict(
+        namespace=PINECONE_NAMESPACE,
+        vector=qv,
+        top_k=req.top_k,
+        include_metadata=True,
     )
+    if req.doc_id:
+        query_kwargs["filter"] = {"doc_id": req.doc_id}
 
-    return {"answer": answer, "chunks": chunks}
+    res = pine_index.query(**query_kwargs)
+    matches = res.get("matches", [])
+    chunks = [m.get("metadata", {}).get("text", "") for m in matches]
+    scores = [m.get("score", 0.0) for m in matches]
 
-@app.post("/ask_with_file")
-def ask_with_file(
-    question: str = Form(...),
-    top_k: int = Form(...),
-    file: UploadFile = File(...)
-):
-    # 1) 读取 PDF 文件内容（字节）
-    pdf_bytes = file.file.read()
+    return {"answer": "(Retrieval) returned chunks from Pinecone", "chunks": chunks, "scores": scores}
 
-    # 2) 用 pypdf 从内存解析（不落地）
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    text_parts = []
-    for page in reader.pages:
-        text_parts.append(page.extract_text() or "")
-    text = "\n".join(text_parts)
-
-    # 3) 切 chunk（用你现有的 chunk_text）
-    chunks_all = chunk_text(text)
-    chunks = chunks_all[:top_k]
-
-    answer = (
-        "(Stage1-Upload) 已解析你上传的 PDF\n"
-        f"question={question}\n"
-        f"filename={file.filename}\n"
-        f"total_chunks={len(chunks_all)}"
-    )
-
-    return {
-        "answer": answer,
-        "chunks": chunks
-    }
-
-class AskRequest(BaseModel):
-    question: str
-    top_k: int = 5
 
 @app.post("/ask")
 def ask(req: AskRequest):
@@ -165,4 +117,33 @@ def ask(req: AskRequest):
         "chunks": chunks,
     }
 
+@app.post("/ask_with_file")
+def ask_with_file(
+    question: str = Form(...),
+    top_k: int = Form(...),
+    file: UploadFile = File(...)
+):
+    # 1) read pdf bytes from UploadFile
+    pdf_bytes = file.file.read()
 
+    # 2) extract text from pdf bytes
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    text_parts = []
+    for page in reader.pages:
+        text_parts.append(page.extract_text() or "")
+    text = "\n".join(text_parts)
+
+    # 3) chunk text and return top k chunks
+    chunks_all = chunk_text(text)
+    chunks = chunks_all[:top_k]
+
+    answer = (
+        f"question={question}\n"
+        f"filename={file.filename}\n"
+        f"total_chunks={len(chunks_all)}"
+    )
+
+    return {
+        "answer": answer,
+        "chunks": chunks
+    }
