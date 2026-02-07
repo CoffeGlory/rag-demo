@@ -2,8 +2,7 @@ import os
 import hashlib
 import streamlit as st
 from pathlib import Path
-import requests 
-
+import requests
 # ----------------------------
 # Configuration
 # set_page_config should be called only once, at the beginning
@@ -62,9 +61,9 @@ if "last_retrieved" not in st.session_state:
     st.session_state["last_retrieved"] = []
 
 # -----------------------------
-# PDF uploader
+# PDF uploader， disabled due to render.com free tier limit.
 # -----------------------------
-uploaded = st.file_uploader("Upload a PDF", type=["pdf"])
+uploaded = st.file_uploader("Upload a PDF", type=["pdf"], disabled=True)  #  disabled due to render.com free tier limit
 
 pdf_bytes = None
 doc_id = None
@@ -127,6 +126,7 @@ is_indexed = (
     if active_doc_id
     else False
 )
+st.info(f"Active doc_id for retrieval: {active_doc_id} | Indexed in this session: {is_indexed}")
 
 with st.sidebar:
     st.divider()
@@ -152,6 +152,24 @@ with st.sidebar:
     else:
         st.caption("No indexing performed yet.")
 
+    #Guard moved from prompt section to here because it blocks user further interaction.
+    #Guard start
+    active_doc_id = st.session_state.get("active_doc_id")
+    # serious guard 1：must have active_doc_id 
+    # Here prevent me from using default PDF without indexing.
+    if not active_doc_id:
+        # st.session_state["messages"].append({"role": "assistant", "content": "No PDF indexed yet. Please click **Index this PDF to Backend** first."})
+        # st.rerun()
+         st.info("No PDF indexed in this session. Searching ALL indexed docs in Pinecone.")
+    # serious guard 2: must haveindex
+    if active_doc_id not in st.session_state.get("indexed_docs", set()):
+        # st.session_state["messages"].append({
+        #     "role": "assistant",
+        #     "content": "This PDF is not indexed yet. Please click **Index this PDF to Backend** first."
+        # })
+        # st.rerun()
+         st.info("No PDF indexed in this session. Searching ALL indexed docs in Pinecone.")
+    #Guard end
 
 # -----------------------------
 # Pinecone Insert button
@@ -160,7 +178,10 @@ with st.sidebar:
 if pdf_bytes is not None:
     # If user already indexed current active_doc_id, we can skip.
     # But note: local_doc_id != backend_doc_id; backend decides doc_id.
-    if st.button("Index this PDF to Backend"):
+
+    st.info("upload and index a PDF disabled due to render.com free tier limit, please use the default PDF or deploy your own backend to enable this feature.")
+
+    if st.button("Index this PDF to Backend", disabled=True):
         if doc_id in st.session_state["doc_map"]:
             st.warning("This document is already indexed in this session.")
         else:
@@ -229,29 +250,13 @@ for msg in st.session_state["messages"]:
 
 # -----------------------------
 # Prompt section
+# active_doc_id: 
 # -----------------------------
 prompt = st.chat_input("Ask a question about the PDF")
 if prompt:
     st.sidebar.write("DEBUG: got prompt")
     st.sidebar.write("DEBUG active_doc_id:", st.session_state.get("active_doc_id"))
     st.sidebar.write("DEBUG indexed_docs size:", len(st.session_state.get("indexed_docs", set())))
-
-    #Guard start
-    active_doc_id = st.session_state.get("active_doc_id")
-    # serious guard 1：must have active_doc_id
-    if not active_doc_id:
-        st.session_state["messages"].append({"role": "assistant", "content": "No PDF indexed yet. Please click **Index this PDF to Backend** first."})
-        st.rerun()
-
-    # serious guard 2: must haveindex
-    if active_doc_id not in st.session_state.get("indexed_docs", set()):
-        st.session_state["messages"].append({
-            "role": "assistant",
-            "content": "This PDF is not indexed yet. Please click **Index this PDF to Backend** first."
-        })
-        st.rerun()
-    #Guard end
-
     
     # 1) print user question in chat history
     st.session_state["messages"].append({"role": "user", "content": prompt})
