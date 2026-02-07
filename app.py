@@ -63,7 +63,7 @@ if "last_retrieved" not in st.session_state:
 # -----------------------------
 # PDF uploader， disabled due to render.com free tier limit.
 # -----------------------------
-uploaded = st.file_uploader("Upload a PDF", type=["pdf"], disabled=True)  #  disabled due to render.com free tier limit
+uploaded = st.file_uploader("Upload a PDF", type=["pdf"], disabled=False)  #  disabled due to render.com free tier limit
 
 pdf_bytes = None
 doc_id = None
@@ -181,7 +181,7 @@ if pdf_bytes is not None:
 
     st.info("upload and index a PDF disabled due to render.com free tier limit, please use the default PDF or deploy your own backend to enable this feature.")
 
-    if st.button("Index this PDF to Backend", disabled=True):
+    if st.button("Index this PDF to Backend", disabled=False):
         if doc_id in st.session_state["doc_map"]:
             st.warning("This document is already indexed in this session.")
         else:
