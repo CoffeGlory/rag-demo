@@ -141,6 +141,7 @@ def upsert_doc_with_marker(doc_id: str, chunks: List[str]) -> int:
 def retrieve_chunks(question: str, top_k: int, doc_id: Optional[str]) -> Tuple[List[str], List[float]]:
     qv = embed_1024([question])[0]
 
+    #kwargs is dict to hold query parameters, we conditionally add filter if doc_id is provided
     query_kwargs = dict(
         namespace=PINECONE_NAMESPACE,
         vector=qv,
@@ -148,12 +149,33 @@ def retrieve_chunks(question: str, top_k: int, doc_id: Optional[str]) -> Tuple[L
         include_metadata=True,
     )
     if doc_id:
-        query_kwargs["filter"] = {"doc_id": doc_id}
+        query_kwargs["filter"] = {"doc_id":  {"$eq": doc_id}}
 
     res = pine_index.query(**query_kwargs)
-    matches = res.get("matches", [])
-    chunks = [m.get("metadata", {}).get("text", "") for m in matches]
-    scores = [m.get("score", 0.0) for m in matches]
+
+    # ---- normalize matches for both dict-like and object-like responses
+    if hasattr(res, "matches"):
+        matches = res.matches or []
+        # object-style match
+        chunks = []
+        scores = []
+        for m in matches:
+            md = getattr(m, "metadata", None) or {}
+            text = md.get("text", "")
+            if text:
+                chunks.append(text)
+                scores.append(float(getattr(m, "score", 0.0) or 0.0))
+        return chunks, scores
+
+    # dict-style response
+    matches = res.get("matches", []) if isinstance(res, dict) else []
+    chunks = []
+    scores = []
+    for m in matches:
+        text = (m.get("metadata", {}) or {}).get("text", "")
+        if text:
+            chunks.append(text)
+            scores.append(float(m.get("score", 0.0) or 0.0))
     return chunks, scores
 
 def generate_answer(question: str, chunks: List[str]) -> str:
