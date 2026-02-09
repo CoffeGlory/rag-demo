@@ -6,3 +6,4 @@ openai
 pinecone[grpc]
 pypdf
 python-multipart
+python-dotenv
