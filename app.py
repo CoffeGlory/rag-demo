@@ -1,3 +1,15 @@
+"""
+app.py
+
+Frontend entry point for the RAG demo application.
+
+This file defines the Streamlit-based user interface, allowing users to:
+- upload PDFs and index them via the backend,
+- ask questions
+- receive answers from openAi API based on the indexed content in the backend.
+
+The frontend interacts witha FastAPI backend deployed on Render.com.
+"""
 import os
 import hashlib
 import streamlit as st
@@ -17,8 +29,7 @@ API_BASE = os.getenv("API_BASE", "https://nasm-rag.onrender.com")
 ASK_URL = f"{API_BASE}/ask"
 INDEX_URL = f"{API_BASE}/index"
 
-st.title("NASM RAG")
-
+# st.title("NASM RAG")
 # -----------------------------
 # Default RAG PDF
 # -----------------------------
@@ -32,7 +43,7 @@ def load_default_pdf():
 # ----------------------------
 # UI
 # ----------------------------
-st.title("RAG Demo (Streamlit + Backend API)")
+st.title("RAG Demo")
 st.caption("Upload PDF → index via backend → ask questions via backend")
 
 # [Strict file based] This sections support openai only generate based on target PDF  
@@ -158,16 +169,9 @@ with st.sidebar:
     # serious guard 1：must have active_doc_id 
     # Here prevent me from using default PDF without indexing.
     if not active_doc_id:
-        # st.session_state["messages"].append({"role": "assistant", "content": "No PDF indexed yet. Please click **Index this PDF to Backend** first."})
-        # st.rerun()
          st.info("No PDF indexed in this session. Searching ALL indexed docs in Pinecone.")
     # serious guard 2: must haveindex
     if active_doc_id not in st.session_state.get("indexed_docs", set()):
-        # st.session_state["messages"].append({
-        #     "role": "assistant",
-        #     "content": "This PDF is not indexed yet. Please click **Index this PDF to Backend** first."
-        # })
-        # st.rerun()
          st.info("No PDF indexed in this session. Searching ALL indexed docs in Pinecone.")
     #Guard end
 
@@ -179,7 +183,7 @@ if pdf_bytes is not None:
     # If user already indexed current active_doc_id, we can skip.
     # But note: local_doc_id != backend_doc_id; backend decides doc_id.
 
-    st.info("upload and index a PDF disabled due to render.com free tier limit, please use the default PDF or deploy your own backend to enable this feature.")
+    # st.info("upload and index a PDF disabled due to render.com free tier limit, please use the default PDF or deploy your own backend to enable this feature.")
 
     if st.button("Index this PDF to Backend", disabled=False):
         if doc_id in st.session_state["doc_map"]:

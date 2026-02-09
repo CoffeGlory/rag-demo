@@ -1,15 +1,37 @@
+"""
+backend.main
+
+This is the backend API for the RAG demo. It provides endpoints to:
+- Index PDFs: extract text, chunk, embed, and upsert to Pinecone with a marker vector for idempotency.
+- Ask questions: retrieve relevant chunks from Pinecone and generate answers using OpenAI.
+
+Key features:
+- Idempotent indexing: uses a marker vector to track if a document has already been indexed
+- Async FastAPI endpoints with anyio to run blocking operations in threads
+- CORS enabled for frontend integration
+- Environment variables for configuration
+
+To run:
+1. Set up your environment variables in a .env file (OPENAI_API_KEY, PINECONE_API_KEY, PINECONE_INDEX)
+2. Install dependencies: pip install -r requirements.txt
+3. Start the server: uvicorn backend.main:app --reload
+
+
+"""
 import io
 import os
 import hashlib
 from typing import Optional, List, Tuple
-
 import anyio
+from dotenv import load_dotenv
 from openai import OpenAI
 from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel
 from pypdf import PdfReader
 from pinecone.grpc import PineconeGRPC as Pinecone
 from fastapi.middleware.cors import CORSMiddleware
+
+load_dotenv()
 
 app = FastAPI()
 
@@ -93,13 +115,13 @@ def make_marker_vector(dim: int) -> List[float]:
     return v
 
 def _fetch_vectors_dict(fetch_res) -> dict:
-    # CHANGED: handle both dict-like and object-like responses from pinecone grpc
+    # handle both dict-like and object-like responses from pinecone grpc
     if isinstance(fetch_res, dict):
         return fetch_res.get("vectors", {}) or {}
     return getattr(fetch_res, "vectors", {}) or {}
 
 def _vector_metadata(vec_obj) -> dict:
-    # CHANGED: handle both dict-like and object-like vector entries
+    # handle both dict-like and object-like vector entries
     if isinstance(vec_obj, dict):
         return vec_obj.get("metadata", {}) or {}
     return getattr(vec_obj, "metadata", {}) or {}

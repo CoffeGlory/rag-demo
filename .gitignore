@@ -1,5 +1,6 @@
 # secrets
 .env
+.streamlit/secrets.toml
 
 # python
 __pycache__/
@@ -17,10 +18,10 @@ venv/
 chroma_db/
 
 # data files (PDFs, etc.)
-data/
+# data/
 
 # OS/editor
 .DS_Store
 Thumbs.db
-.vscode/
+.vscode/4
 .idea/
